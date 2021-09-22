@@ -7,6 +7,11 @@ import sys
 if '../../../embeddings' not in sys.path:
     sys.path.append('../../../embeddings')
 
+import h5py
+import hashlib
+import numpy as np
+from tqdm import tqdm
+
 from seq2tensor import s2t
 import keras
 
@@ -17,13 +22,34 @@ from keras.layers.merge import Concatenate, concatenate, subtract, multiply
 from keras.layers.convolutional import Conv1D
 from keras.layers.pooling import MaxPooling1D, AveragePooling1D, GlobalAveragePooling1D
 
-from keras.optimizers import Adam,  RMSprop
+# from keras.optimizers import Adam,  RMSprop
+from tensorflow.keras.optimizers import Adam, RMSprop
 
 import os
-import tensorflow as tf
-import keras.backend.tensorflow_backend as KTF
+# import tensorflow as tf
+import tensorflow._api.v2.compat.v1 as tf
+tf.disable_v2_behavior()
+# import keras.backend.tensorflow_backend as KTF
+from keras.backend import set_session
 
-def get_session(gpu_fraction=0.25):
+
+def get_emb_dim(h5_file):
+    f = h5py.File(h5_file, 'r')
+    k = list(f.keys())[0]
+    emb_dim = np.array(f[k]).shape[-1]
+    f.close()
+    return emb_dim
+
+def load_emb(h5, seq, length):
+    md5 = hashlib.md5(seq.encode()).hexdigest()
+    emb = np.array(h5[md5])
+    if len(emb) > length:
+        return emb[:length, :]
+    else:
+        emb_ = np.pad(emb, ((0, length-len(emb)), (0, 0)))
+        return emb_
+
+def get_session(gpu_fraction=0.4):
     '''Assume that you have 6GB of GPU memory and want to allocate ~2GB'''
 
     num_threads = os.environ.get('OMP_NUM_THREADS')
@@ -35,17 +61,66 @@ def get_session(gpu_fraction=0.25):
     else:
         return tf.Session(config=tf.ConfigProto(gpu_options=gpu_options))
 
-KTF.set_session(get_session())
 
-import numpy as np
-from tqdm import tqdm
+# class DataGenerator(keras.utils.Sequence):
+class DataGenerator(keras.utils.all_utils.Sequence):
+    def __init__(self, h5_file, seq_array, seq1_ids, seq2_ids, labels, seq_len, batch_size, shuffle=True, for_eval=False):
+        assert len(seq1_ids) == len(seq2_ids) == len(labels)
+        self.seqs_1 = [seq_array[i] for i in seq1_ids]
+        self.seqs_2 = [seq_array[i] for i in seq2_ids]
+        self.labels = labels
+        self.seq_len = seq_len
+
+        # self.h5 = h5py.File(h5_file, 'r')
+        self.h5 = dict()
+        with h5py.File(h5_file, 'r') as fp:
+            for seq in tqdm(self.seqs_1 + self.seqs_2):
+                k = hashlib.md5(seq.encode()).hexdigest()
+                self.h5[k] = np.array(fp[k])
+
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.for_eval = for_eval
+        self.on_epoch_end()
+
+    def __len__(self):
+        return int(np.ceil(len(self.labels) / self.batch_size))
+
+    def __getitem__(self, idx):
+        indexes = self.indexes[idx*self.batch_size:(idx+1)*self.batch_size]
+
+        X1, X2, Y = [], [], []
+        for i in indexes:
+            X1.append(load_emb(self.h5, self.seqs_1[i], self.seq_len))
+            X2.append(load_emb(self.h5, self.seqs_2[i], self.seq_len))
+            Y.append(self.labels[i])
+
+        X1 = np.array(X1)
+        X2 = np.array(X2)
+        Y = np.array(Y)
+        if self.for_eval:
+            return X1, X2
+        else:
+            return (X1, X2), Y
+
+    def on_epoch_end(self):
+        self.indexes = np.arange(len(self.labels))
+        if self.shuffle:
+            np.random.shuffle(self.indexes)
+
+# KTF.set_session(get_session())
+set_session(get_session())
+
 
 from keras.layers import Input, CuDNNGRU
 from numpy import linalg as LA
 import scipy
 
 # Note: if you use another PPI dataset, this needs to be changed to a corresponding dictionary file.
-id2seq_file = '../../../yeast/preprocessed/protein.dictionary.tsv'
+# id2seq_file = '../../../yeast/preprocessed/protein.dictionary.tsv'
+
+id2seq_file = '../../../data/human_dict.tsv'
+
 
 id2index = {}
 seqs = []
@@ -59,9 +134,10 @@ seq_array = []
 id2_aid = {}
 sid = 0
 
-seq_size = 2000
+# seq_size = 2000
+seq_size = 1000
 emb_files = ['../../../embeddings/default_onehot.txt', '../../../embeddings/string_vec5.txt', '../../../embeddings/CTCoding_onehot.txt', '../../../embeddings/vec5_CTC.txt']
-use_emb = 0
+emb_h5 = 'S2F_emb/human_train.h5'
 hidden_dim = 25
 n_epochs=50
 
@@ -72,13 +148,12 @@ rst_file = 'results/15k_onehot_cnn.txt'
 sid1_index = 0
 sid2_index = 1
 if len(sys.argv) > 1:
-    ds_file, label_index, rst_file, use_emb, hidden_dim, n_epochs = sys.argv[1:]
+    ds_file, label_index, rst_file, emb_h5, hidden_dim, n_epochs = sys.argv[1:]
     label_index = int(label_index)
-    use_emb = int(use_emb)
     hidden_dim = int(hidden_dim)
     n_epochs = int(n_epochs)
 
-seq2t = s2t(emb_files[use_emb])
+dim = get_emb_dim(emb_h5)
 
 max_data = -1
 limit_data = max_data > 0
@@ -86,7 +161,6 @@ raw_data = []
 skip_head = True
 x = None
 count = 0
-
 for line in tqdm(open(ds_file)):
     if skip_head:
         skip_head = False
@@ -117,8 +191,8 @@ avg_m_seq = int(np.average(len_m_seq)) + 1
 max_m_seq = max(len_m_seq)
 print (avg_m_seq, max_m_seq)
 
-dim = seq2t.dim
-seq_tensor = np.array([seq2t.embed_normalized(line, seq_size) for line in tqdm(seq_array)])
+# emb_h5 = h5py.File(emb_h5, 'r')
+# seq_tensor = np.array([load_emb(emb_h5, s, seq_size) for s in tqdm(seq_array)])
 
 seq_index1 = np.array([line[sid1_index] for line in tqdm(raw_data)])
 seq_index2 = np.array([line[sid2_index] for line in tqdm(raw_data)])
@@ -192,13 +266,15 @@ total = []
 total_truth = []
 train_test = []
 for train, test in kf.split(class_labels):
-    if np.sum(class_labels[train], 0)[0] > 0.8 * len(train) or np.sum(class_labels[train], 0)[0] < 0.2 * len(train):
+    if np.sum(class_labels[train], 0)[0] > 0.93 * len(train) or np.sum(class_labels[train], 0)[0] < 0.07 * len(train): ###aaaa
         continue
     train_test.append((train, test))
     cur += 1
     if cur >= tries:
         break
 
+
+fold_count = 0
 print (len(train_test))
 
 #copy below
@@ -210,45 +286,82 @@ num_false_pos = 0.
 num_true_neg = 0.
 num_false_neg = 0.
 
+def generator_fn(h5_file, seq_array, seq1_ids, seq2_ids, labels, seq_len, shuffle=False, for_eval=False):
+    assert len(seq1_ids) == len(seq2_ids) == len(labels)
+    seqs_1 = [seq_array[i] for i in seq1_ids]
+    seqs_2 = [seq_array[i] for i in seq2_ids]
+
+    h5 = dict()
+    with h5py.File(h5_file, 'r') as fp:
+        for seq in tqdm(list(set(seqs_1 + seqs_2))):
+            k = hashlib.md5(seq.encode()).hexdigest()
+            h5[k] = np.array(fp[k])
+
+    indexes = np.arange(len(labels))
+    if shuffle:
+        np.random.shuffle(indexes)
+
+    def generator():
+        if shuffle:
+            np.random.shuffle(indexes)
+
+        for i in indexes:
+            x1 = load_emb(h5, seqs_1[i], seq_len)
+            x2 = load_emb(h5, seqs_2[i], seq_len)
+            y = labels[i]
+            if for_eval:
+                yield x1, x2
+            else:
+                yield (x1, x2), y
+
+    return generator
+
+
 for train, test in train_test:
+    # train_gen = DataGenerator(emb_h5, seq_array, seq_index1[train], seq_index2[train], class_labels[train],
+    #                           seq_size, batch_size1, shuffle=True)
+    # valid_gen = DataGenerator(emb_h5, seq_array, seq_index1[test], seq_index2[test], class_labels[test],
+    #                           seq_size, batch_size1, shuffle=False)
+
+    train_gen = generator_fn(emb_h5, seq_array, seq_index1[train], seq_index2[train], class_labels[train], seq_size, shuffle=True)
+    valid_gen = generator_fn(emb_h5, seq_array, seq_index1[test], seq_index2[test], class_labels[test], seq_size)
+    # test_gen = generator_fn(emb_h5, seq_array, seq_index1[test], seq_index2[test], class_labels[test], seq_size, for_eval=True)
+
+    train_ds = tf.data.Dataset.from_generator(train_gen, output_types=((np.float32, np.float32), np.float64),
+                                              output_shapes=(((seq_size, dim), (seq_size, dim)), (2,)))
+    valid_ds = tf.data.Dataset.from_generator(valid_gen, output_types=((np.float32, np.float32), np.float64),
+                                              output_shapes=(((seq_size, dim), (seq_size, dim)), (2,)))
+
+    train_ds = train_ds.repeat().batch(batch_size1, drop_remainder=True).prefetch(1)
+    valid_ds = valid_ds.batch(batch_size1, drop_remainder=True).prefetch(1)
+
+    save_name = rst_file.split('.')[0] + '_weights_fold{}.h5'.format(fold_count)
+    # save_name = rst_file.split('/')[0] + '/models/' + rst_file.split('/')[1].split('.')[0] + '_weights_fold-{}.'.format(fold_count) + '{epoch:02d}-{val_loss:.2f}.h5'
+    fold_count += 1
+
+    # callbacks = [
+    # keras.callbacks.ModelCheckpoint(save_name, verbose=1,
+    # save_weights_only=False, save_best_only=True, monitor='val_loss')
+    # ]
+
     merge_model = None
     merge_model = build_model()
     adam = Adam(lr=0.001, amsgrad=True, epsilon=1e-6)
     rms = RMSprop(lr=0.001)
     merge_model.compile(optimizer=adam, loss='categorical_crossentropy', metrics=['accuracy'])
-    merge_model.fit([seq_tensor[seq_index1[train]], seq_tensor[seq_index2[train]]], class_labels[train], batch_size=batch_size1, epochs=n_epochs)
-    #result1 = merge_model.evaluate([seq_tensor1[test], seq_tensor2[test]], class_labels[test])
-    pred = merge_model.predict([seq_tensor[seq_index1[test]], seq_tensor[seq_index2[test]]])
-    for i in range(len(class_labels[test])):
-        num_total += 1
-        if np.argmax(class_labels[test][i]) == np.argmax(pred[i]):
-            num_hit += 1
-        if class_labels[test][i][0] > 0.:
-            num_pos += 1.
-            if pred[i][0] > pred[i][1]:
-                num_true_pos += 1
-            else:
-                num_false_neg += 1
-        else:
-            if pred[i][0] > pred[i][1]:
-                num_false_pos += 1
-            else:
-                num_true_neg += 1
-    accuracy = num_hit / num_total
-    prec = num_true_pos / (num_true_pos + num_false_pos)
-    recall = num_true_pos / num_pos
-    spec = num_true_neg / (num_true_neg + num_false_neg)
-    f1 = 2. * prec * recall / (prec + recall)
-    mcc = (num_true_pos * num_true_neg - num_false_pos * num_false_neg) / ((num_true_pos + num_true_neg) * (num_true_pos + num_false_neg) * (num_false_pos + num_true_neg) * (num_false_pos + num_false_neg)) ** 0.5
-    print (accuracy, prec, recall, spec, f1, mcc)
-
-accuracy = num_hit / num_total
-prec = num_true_pos / (num_true_pos + num_false_pos)
-recall = num_true_pos / num_pos
-spec = num_true_neg / (num_true_neg + num_false_neg)
-f1 = 2. * prec * recall / (prec + recall)
-mcc = (num_true_pos * num_true_neg - num_false_pos * num_false_neg) / ((num_true_pos + num_true_neg) * (num_true_pos + num_false_neg) * (num_false_pos + num_true_neg) * (num_false_pos + num_false_neg)) ** 0.5
-print (accuracy, prec, recall, f1)
-
-with open(rst_file, 'w') as fp:
-    fp.write('acc=' + str(accuracy) + '\tprec=' + str(prec) + '\trecall=' + str(recall) + '\tspec=' + str(spec) + '\tf1=' + str(f1) + '\tmcc=' + str(mcc))
+    # merge_model.fit([seq_tensor[seq_index1[train]], seq_tensor[seq_index2[train]]], class_labels[train],
+    #                 batch_size=batch_size1, epochs=n_epochs, callbacks=callbacks,
+    #                 validation_data=([seq_tensor[seq_index1[test]], seq_tensor[seq_index2[test]]], class_labels[test]))
+    merge_model.fit(train_ds, epochs=n_epochs, validation_data=valid_ds,
+                    steps_per_epoch=len(train)//batch_size1,
+                    validation_steps=len(test)//batch_size1,
+                    callbacks=[
+                        tf.keras.callbacks.ModelCheckpoint(
+                            filepath=save_name,
+                            monitor='val_loss',
+                            mode='min',
+                            save_freq='epoch',
+                            save_weights_only=False,
+                            save_best_only=True)
+                    ])
+    # merge_model.fit_generator(train_gen, epochs=n_epochs, callbacks=callbacks, validation_data=valid_gen)
